@@ -1,0 +1,20 @@
+# Ignore the virtual environment
+venv/
+
+# Ignore Python cache & temp files
+__pycache__/
+*.pyc
+
+# Ignore data logs or large outputs
+*.csv
+*.mp4
+*.avi
+*.log
+*.json
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore notebook checkpoints
+.ipynb_checkpoints/
