@@ -18,3 +18,5 @@ Thumbs.db
 
 # Ignore notebook checkpoints
 .ipynb_checkpoints/
+
+api.txt
