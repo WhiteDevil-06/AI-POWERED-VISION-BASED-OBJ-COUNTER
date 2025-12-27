@@ -8,7 +8,10 @@ from scipy.spatial import distance as dist
 
 # --- TRACKER CLASS ---
 class CentroidTracker:
-    def __init__(self, max_disappeared=40, max_distance=100):
+    # TUNED FOR STABILITY:
+    # max_disappeared=60: ID stays alive for ~2-3 seconds even if detection fails.
+    # max_distance=150: Objects can move further between frames without ID switch.
+    def __init__(self, max_disappeared=60, max_distance=150):
         self.next_object_id = 0
         self.objects = OrderedDict()
         self.disappeared = OrderedDict()
