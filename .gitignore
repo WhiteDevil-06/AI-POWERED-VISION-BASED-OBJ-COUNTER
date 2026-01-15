@@ -1,22 +1,28 @@
-# Ignore the virtual environment
-venv/
-
-# Ignore Python cache & temp files
+# Python
 __pycache__/
-*.pyc
-
-# Ignore data logs or large outputs
-*.csv
-*.mp4
-*.avi
+*.py[cod]
+*$py.class
 *.log
-*.json
+*.tmp
 
-# Ignore system files
+# Virtual Environments
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
 .DS_Store
+
+# Streamlit
+.streamlit/
+config.toml
+credentials.toml
+
+# Project Specific
+# We KEEP .pt files (models) unless they are >100MB
+# *.pt
+
+# OS Generated
 Thumbs.db
-
-# Ignore notebook checkpoints
-.ipynb_checkpoints/
-
-api.txt
+ehthumbs.db
+Desktop.ini
