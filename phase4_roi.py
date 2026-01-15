@@ -2,17 +2,18 @@ import cv2
 import time
 import numpy as np
 import os
-from ultralytics import YOLO
+import datetime
 from collections import OrderedDict
-from scipy.spatial import distance as dist
 
-# --- TRACKER CLASS ---
+# --- FIX MATPLOTLIB HANG (Must be before importing ultralytics) ---
+import matplotlib
+matplotlib.use('Agg') 
+from ultralytics import YOLO
+
+# --- TRACKER CLASS (PURE NUMPY) ---
 class CentroidTracker:
-    # TUNED FOR STABILITY:
-    # max_disappeared=60: ID stays alive for ~2-3 seconds even if detection fails.
-    # max_distance=150: Objects can move further between frames without ID switch.
-    def __init__(self, max_disappeared=60, max_distance=150):
-        self.next_object_id = 0
+    def __init__(self, max_disappeared=80, max_distance=250): # TUNED: Increased tolerance to prevent ID switching
+        self.next_object_id = 1
         self.objects = OrderedDict()
         self.disappeared = OrderedDict()
         self.max_disappeared = max_disappeared
@@ -47,7 +48,15 @@ class CentroidTracker:
         else:
             object_ids = list(self.objects.keys())
             object_centroids = list(self.objects.values())
-            D = dist.cdist(np.array(object_centroids), input_centroids)
+            
+            # CALC DISTANCE (PURE NUMPY)
+            D = np.zeros((len(object_centroids), len(input_centroids)))
+            for i in range(len(object_centroids)):
+                for j in range(len(input_centroids)):
+                    dx = object_centroids[i][0] - input_centroids[j][0]
+                    dy = object_centroids[i][1] - input_centroids[j][1]
+                    D[i, j] = np.sqrt(dx*dx + dy*dy)
+
             rows = D.min(axis=1).argsort()
             cols = D.argmin(axis=1)[rows]
             used_rows = set()
@@ -74,104 +83,161 @@ class CentroidTracker:
                 self.register(input_centroids[col])
         return self.objects
 
-# --- MAIN VISION LOGIC ---
+# --- MAIN LOGIC ---
 def run_vision_lab():
-    print("🚀 LAUNCHING VISION TEST LAB...")
+    print("🚀 STEP 1: LOADING YOLO MODEL (Please Wait 10s)...", flush=True)
     
-    # 1. MODEL LOADING STRATEGY
-    model_path = "yolov8n.pt" # Default
-    if os.path.exists("mega_v3.pt"):
-        model_path = "mega_v3.pt"
-        print(f"✅ DETECTED MEGA MODEL: {model_path}")
-    elif os.path.exists("roboflow_v2.pt"):
-        model_path = "roboflow_v2.pt"
-        print(f"✅ DETECTED ROBOFLOW MODEL: {model_path}")
-    else:
-        print("⚠️ NO CUSTOM MODEL FOUND. USING BASE YOLOV8n.")
+    # 1. LOAD MODEL (BLOCKING - NO ERROR HIDING)
+    path = "roboflow_v2.pt" if os.path.exists("roboflow_v2.pt") else "yolov8n.pt"
+    print(f"   -> Found Model: {path}", flush=True)
+    
+    try:
+        # FIX FOR PYTORCH 2.6+ SECURITY ERROR (Monkey Patch)
+        import torch
+        _orig_load = torch.load
+        def safe_load(*args, **kwargs):
+            if 'weights_only' not in kwargs: kwargs['weights_only'] = False
+            return _orig_load(*args, **kwargs)
+        torch.load = safe_load
+        
+        print("🔒 PATCH APPLIED: Legacy Model Loading Enabled.", flush=True)
 
-    model = YOLO(model_path)
-    # Force single class mode if using custom model (Classes are usually 0)
-    ALLOWED_CLASSES = [0] if "yolov8n" not in model_path else [0, 39, 41, 67, 73]
+        model = YOLO(path)
+        
+        # Restore original (optional, but good practice)
+        torch.load = _orig_load
+        
+        # Warmup
+        model(np.zeros((100,100,3), dtype='uint8'), verbose=False)
+        print("✅ STEP 1 COMPLETE: Model Loaded.", flush=True)
+    except Exception as e:
+        print(f"❌ CRITICAL ERROR LOADING MODEL: {e}")
+        return
 
-    # 2. CAMERA
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    # 2. LOAD CAMERA
+    print("🚀 STEP 2: CONNECTING TO CAMERA...", flush=True)
+    # Try Index 0 first
+    cap = cv2.VideoCapture(0)
+    
+    if not cap.isOpened() or not cap.read()[0]:
+        print("⚠️ Warning: Camera 0 failed. Trying Index 1...", flush=True)
+        cap = cv2.VideoCapture(1)
+
+    if not cap.isOpened():
+        print("❌ CRITICAL ERROR: NO CAMERA FOUND.")
+        print("   -> Check if Zoom/Teams/Browser is using it.")
+        return
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    print("✅ STEP 2 COMPLETE: Camera Active.", flush=True)
 
-    # 3. SETTINGS
-    roi_rect = (300, 100, 600, 400) # x, y, w, h
-    tracker = CentroidTracker()
+    # 3. SETUP LOOP
+    roi_rect = (400, 150, 480, 400) # (x, y, w, h) - Make sure this covers the belt
+    tracker = CentroidTracker(max_disappeared=80, max_distance=250)
     
     total_count = 0
+    expected_count = 100
     counted_ids = set()
     stuck_log = {}
     
-    # 4. LOOP
-    print("🟢 SYSTEM LIVE. PRESS 'q' TO EXIT.")
+    system_active = False 
+    start_time = time.time()
     
+    print("🟢 SYSTEM LIVE. WINDOW SHOULD BE OPEN.", flush=True)
+
     while True:
         ret, frame = cap.read()
-        if not ret: break
+        if not ret:
+            print("❌ ERROR: Camera stream lost.")
+            break
         
-        # A. DRAW ROI
+        # A. ROI VISUALS
         rx, ry, rw, rh = roi_rect
-        cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
-        cv2.putText(frame, "ACTIVE ZONE", (rx, ry-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        roi_color = (0, 255, 0)
         
         # B. DETECT
+        detections = []
+        cls_filter = [0, 39, 41]
+        
+        # Run Inference
         results = model(frame, conf=0.5, verbose=False)
-        rects = []
         
         for r in results:
-            boxes = r.boxes
-            for box in boxes:
+            for box in r.boxes:
                 cls_id = int(box.cls[0])
-                if cls_id in ALLOWED_CLASSES:
+                if cls_id in cls_filter:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    conf = float(box.conf[0])
+                    conf = float(box.conf[0]) # Get Confidence
+                    detections.append((x1, y1, x2, y2))
                     
-                    # Add to tracker
-                    rects.append((x1, y1, x2, y2))
-                    
-                    # Visuals
-                    label = f"BOX {int(conf*100)}%"
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 100, 0), 2)
-                    cv2.putText(frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 0), 2)
+                    # Draw Raw Detection (Dim Color)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 100, 0), 1)
+                    # SHOW ACCURACY (USER REQ)
+                    cv2.putText(frame, f"{int(conf*100)}%", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 0), 1)
 
-        # C. TRACK & COUNT
-        objects = tracker.update(rects)
-        
-        for (obj_id, centroid) in objects.items():
-            cx, cy = centroid
-            
-            # Check ROI
-            in_roi = (rx < cx < rx+rw) and (ry < cy < ry+rh)
-            
-            if in_roi:
-                # Count
-                if obj_id not in counted_ids:
-                    total_count += 1
-                    counted_ids.add(obj_id)
-                    # Flash effect
-                    cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 255), 5)
+        # C. SMART START
+        if not system_active:
+            if len(detections) > 0:
+                system_active = True
+                print("⚡ SYSTEM ACTIVATED: First Box Detected!")
+            elif (time.time() - start_time) > 60:
+                system_active = True
+                print("⚡ SYSTEM ACTIVATED: Timeout (60s).")
+
+        # D. TRACKING
+        if system_active:
+            objects = tracker.update(detections)
+            ids_to_kill = [] # Fix Loop Mutation
+
+            # Use list() to create a copy of items for iteration
+            for (obj_id, centroid) in list(objects.items()):
+                cx, cy = centroid
                 
-                # Stuck Logic
-                if obj_id not in stuck_log:
-                    stuck_log[obj_id] = time.time()
-                elif (time.time() - stuck_log[obj_id]) > 5.0:
-                    cv2.putText(frame, "⚠️ STUCK!", (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 3)
+                in_roi_x = rx < cx < (rx + rw)
+                in_roi_y = ry < cy < (ry + rh)
+                in_roi = in_roi_x and in_roi_y
+                
+                text_color = (0, 255, 0) if in_roi else (0, 100, 255)
+                cv2.putText(frame, f"ID {obj_id}", (cx-10, cy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+                cv2.circle(frame, (cx, cy), 4, text_color, -1)
 
-            else:
-                 if obj_id in stuck_log: del stuck_log[obj_id]
+                if in_roi:
+                    if obj_id not in counted_ids:
+                        total_count += 1
+                        counted_ids.add(obj_id)
+                        cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 255), 5)
+                    
+                    if obj_id not in stuck_log:
+                        stuck_log[obj_id] = time.time()
+                    elif (time.time() - stuck_log[obj_id]) > 5.0:
+                        # Refined Notification (Bottom of ROI)
+                        msg = f"NOTIFICATION: OBJECT {obj_id} STUCK"
+                        cv2.putText(frame, msg, (rx, ry + rh + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                        cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 0, 255), 3) # Red border on ROI
+                else:
+                    if obj_id in stuck_log: del stuck_log[obj_id]
+                    # KILL IF EXITING RIGHT (and buffer zone 50px)
+                    if cx > (rx + rw + 50): 
+                         ids_to_kill.append(obj_id)
 
-            # Draw ID
-            cv2.putText(frame, f"ID {obj_id}", (cx-10, cy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            cv2.circle(frame, (cx, cy), 4, (0, 255, 0), -1)
+            # Cleanup IDs safely
+            for kid in ids_to_kill:
+                 tracker.deregister(kid)
 
-        # D. HUD
-        cv2.putText(frame, f"COUNT: {total_count}", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 4)
+        # E. HUD
+        status_txt = "ACTIVE" if system_active else "WAITING..."
+        cv2.putText(frame, f"STATUS: {status_txt}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(frame, f"EXPECTED: {expected_count}", (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"ACTUAL:   {total_count}", (30, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        cv2.putText(frame, ts, (1100, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+        
+        roi_thick = 3 if system_active else 1
+        cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), roi_color, roi_thick)
+        cv2.putText(frame, "SCAN ZONE", (rx, ry-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, roi_color, 1)
 
-        cv2.imshow("TEST LAB", frame)
+        cv2.imshow("Box Sense AI cam", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 

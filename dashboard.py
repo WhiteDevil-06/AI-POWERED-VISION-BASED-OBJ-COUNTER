@@ -4,6 +4,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import cv2
+import os
+from collections import OrderedDict
+import matplotlib
+matplotlib.use('Agg') # Fix for thread crashes
+from ultralytics import YOLO
 
 # --- CONFIGURATION & STATE ---
 def init_state():
@@ -15,11 +20,107 @@ def init_state():
         ]
     
     if 'logs' not in st.session_state:
-        # Dummy logs for demo
-        st.session_state['logs'] = [
-            {"time": "10:15:22", "batch_id": "#8821", "sku": "NIKE-AIR-90", "boxes": 50, "total_units": 600},
-            {"time": "11:05:00", "batch_id": "#8822", "sku": "IPHONE-15-PM", "boxes": 20, "total_units": 200},
-        ]
+        # Start with empty logs for production
+        st.session_state['logs'] = []
+
+# --- CENTROID TRACKER (COPIED FROM PHASE 4) ---
+class CentroidTracker:
+    def __init__(self, max_disappeared=80, max_distance=250):
+        self.next_object_id = 1
+        self.objects = OrderedDict()
+        self.disappeared = OrderedDict()
+        self.max_disappeared = max_disappeared
+        self.max_distance = max_distance
+
+    def register(self, centroid):
+        self.objects[self.next_object_id] = centroid
+        self.disappeared[self.next_object_id] = 0
+        self.next_object_id += 1
+
+    def deregister(self, object_id):
+        del self.objects[object_id]
+        del self.disappeared[object_id]
+
+    def update(self, rects):
+        if len(rects) == 0:
+            for object_id in list(self.disappeared.keys()):
+                self.disappeared[object_id] += 1
+                if self.disappeared[object_id] > self.max_disappeared:
+                    self.deregister(object_id)
+            return self.objects
+
+        input_centroids = np.zeros((len(rects), 2), dtype="int")
+        for (i, (startX, startY, endX, endY)) in enumerate(rects):
+            cX = int((startX + endX) / 2.0)
+            cY = int((startY + endY) / 2.0)
+            input_centroids[i] = (cX, cY)
+
+        if len(self.objects) == 0:
+            for i in range(0, len(input_centroids)):
+                self.register(input_centroids[i])
+        else:
+            object_ids = list(self.objects.keys())
+            object_centroids = list(self.objects.values())
+            
+            # CALC DISTANCE (PURE NUMPY)
+            D = np.zeros((len(object_centroids), len(input_centroids)))
+            for i in range(len(object_centroids)):
+                for j in range(len(input_centroids)):
+                    dx = object_centroids[i][0] - input_centroids[j][0]
+                    dy = object_centroids[i][1] - input_centroids[j][1]
+                    D[i, j] = np.sqrt(dx*dx + dy*dy)
+
+            rows = D.min(axis=1).argsort()
+            cols = D.argmin(axis=1)[rows]
+            used_rows = set()
+            used_cols = set()
+
+            for (row, col) in zip(rows, cols):
+                if row in used_rows or col in used_cols: continue
+                if D[row][col] > self.max_distance: continue
+                object_id = object_ids[row]
+                self.objects[object_id] = input_centroids[col]
+                self.disappeared[object_id] = 0
+                used_rows.add(row)
+                used_cols.add(col)
+
+            unused_rows = set(range(0, D.shape[0])).difference(used_rows)
+            for row in unused_rows:
+                object_id = object_ids[row]
+                self.disappeared[object_id] += 1
+                if self.disappeared[object_id] > self.max_disappeared:
+                    self.deregister(object_id)
+
+            unused_cols = set(range(0, D.shape[1])).difference(used_cols)
+            for col in unused_cols:
+                self.register(input_centroids[col])
+        return self.objects
+
+# --- MODEL LOADER (CACHED) ---
+@st.cache_resource
+def load_yolo_model():
+    path = "roboflow_v2.pt" if os.path.exists("roboflow_v2.pt") else "yolov8n.pt"
+    
+    # FIX FOR PYTORCH 2.6+
+    try:
+        import torch
+        _orig_load = torch.load
+        def safe_load(*args, **kwargs):
+            if 'weights_only' not in kwargs: kwargs['weights_only'] = False
+            return _orig_load(*args, **kwargs)
+        torch.load = safe_load
+        
+        model = YOLO(path)
+        
+        # Restore original
+        torch.load = _orig_load
+        
+        # Warmup
+        model(np.zeros((100,100,3), dtype='uint8'), verbose=False)
+        return model, path
+    except Exception as e:
+        st.error(f"Failed to load model: {e}")
+        return None, "Error"
 
 def apply_obsidian_theme():
     st.markdown("""
@@ -268,7 +369,7 @@ def main():
                     time.sleep(1)
                     st.rerun()
 
-    # --- TAB 3: VISION OPS ---
+    # --- TAB 3: VISION OPS (INTEGRATED) ---
     with tab_vis:
         # Header Control Bar
         c_sel, c_exp, c_act = st.columns([2, 1, 1])
@@ -288,17 +389,111 @@ def main():
         # Visual Feed Area
         st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
         
+        # --- THE VISION LOGIC ---
         if st.session_state['cam_active']:
-            st.warning("🔴 LIVE FEED SIMULATION (CONNECTING TO YOLO MODEL...)")
-            # Placeholder for camera feed
-            st.image("https://placehold.co/1280x720/0E0E10/333333.png?text=CAMERA+ACTIVE\\nDETECTING+BOXES...", use_container_width=True)
+            # 1. Init Model
+            model, model_path = load_yolo_model()
+            if model is None:
+                st.error("Model Failed to Load")
+                st.stop()
             
-            # Overlay Metrics (Simulated)
-            m1, m2, m3 = st.columns(3)
-            m1.metric("BOXES DETECTED", "12")
-            m2.metric("CURRENT CONFIDENCE", "88%")
-            m3.metric("FPS", "30")
+            # 2. Init Camera
+            cap = cv2.VideoCapture(0) # Default
+            if not cap.isOpened() or not cap.read()[0]:
+                cap = cv2.VideoCapture(1) # Backup
             
+            if not cap.isOpened():
+                st.error("❌ NO CAMERA DETECTED")
+                st.session_state['cam_active'] = False
+            else:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                
+                # 3. Init Tracker & Vars
+                tracker = CentroidTracker(max_disappeared=80, max_distance=250)
+                roi_rect = (400, 150, 480, 400)
+                start_time = time.time()
+                system_active = False
+                total_count = 0
+                counted_ids = set()
+                stuck_log = {}
+                
+                # Streamlit UI Elements
+                st_frame = st.image([]) # Placeholder for video
+                stop_btn = st.button("🔴 EMERGENCY STOP", key='emg_stop')
+
+                # 4. LOOP
+                while True:
+                    ret, frame = cap.read()
+                    if not ret: break
+                    
+                    # Logic copied from phase4_roi.py
+                    rx, ry, rw, rh = roi_rect
+                    roi_color = (0, 255, 0)
+                    
+                    detections = []
+                    results = model(frame, conf=0.5, verbose=False)
+                    
+                    for r in results:
+                        for box in r.boxes:
+                            cls_id = int(box.cls[0])
+                            if cls_id in [0, 39, 41]:
+                                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                                conf = float(box.conf[0])
+                                detections.append((x1, y1, x2, y2))
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 100, 0), 1)
+                                cv2.putText(frame, f"{int(conf*100)}%", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 100, 0), 1)
+
+                    if not system_active:
+                        if len(detections) > 0: system_active = True
+                        elif (time.time() - start_time) > 60: system_active = True
+
+                    if system_active:
+                        objects = tracker.update(detections)
+                        ids_to_kill = []
+                        
+                        for (obj_id, centroid) in list(objects.items()):
+                            cx, cy = centroid
+                            in_roi = (rx < cx < (rx + rw)) and (ry < cy < (ry + rh))
+                            
+                            color = (0, 255, 0) if in_roi else (0, 100, 255)
+                            cv2.putText(frame, f"ID {obj_id}", (cx-10, cy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                            cv2.circle(frame, (cx, cy), 4, color, -1)
+
+                            if in_roi:
+                                if obj_id not in counted_ids:
+                                    total_count += 1
+                                    counted_ids.add(obj_id)
+                                    cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 255), 5)
+                                
+                                if obj_id not in stuck_log: stuck_log[obj_id] = time.time()
+                                elif (time.time() - stuck_log[obj_id]) > 5.0:
+                                    msg = f"NOTIFICATION: OBJECT {obj_id} STUCK"
+                                    cv2.putText(frame, msg, (rx, ry + rh + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                                    cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 0, 255), 3)
+                            else:
+                                if obj_id in stuck_log: del stuck_log[obj_id]
+                                if cx > (rx + rw + 50): ids_to_kill.append(obj_id)
+                        
+                        for k in ids_to_kill: tracker.deregister(k)
+
+                    # HUD
+                    roi_thick = 3 if system_active else 1
+                    cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), roi_color, roi_thick)
+                    cv2.putText(frame, f"COUNT: {total_count} / {expected}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+
+                    # Display in Streamlit (BGR -> RGB)
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    st_frame.image(frame_rgb, channels="RGB")
+                    
+                    # Stop Condition
+                    if stop_btn:
+                        st.session_state['cam_active'] = False
+                        cap.release()
+                        st.rerun()
+
+                cap.release()
+
         else:
             st.info("ℹ️ CAMERA OFFLINE. CLICK START TO BEGIN SESSION.")
             st.image("https://placehold.co/1280x720/0E0E10/1C1C1E.png?text=SYSTEM+READY", use_container_width=True)
@@ -331,17 +526,17 @@ def main():
             st.markdown("##### 📐 ROI CALIBRATION")
             st.caption("Adjust the slider to match your conveyor belt Area of Interest.")
             
-            rx = st.slider("X OFFSET", 0, 640, 150)
-            ry = st.slider("Y OFFSET", 0, 480, 100)
-            rw = st.slider("WIDTH", 100, 600, 340)
-            rh = st.slider("HEIGHT", 100, 400, 200)
+            rx = st.slider("X OFFSET", 0, 640, 400)
+            ry = st.slider("Y OFFSET", 0, 480, 150)
+            rw = st.slider("WIDTH", 100, 600, 480)
+            rh = st.slider("HEIGHT", 100, 400, 400)
             
         with c2:
             # LIVE PREVIEW MOCKUP
             st.markdown("##### 👁️ PREVIEW")
             
             # Generate black canvas
-            preview = np.zeros((480, 640, 3), dtype=np.uint8)
+            preview = np.zeros((720, 1280, 3), dtype=np.uint8)
             # Draw ROI
             cv2.rectangle(preview, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
             # Add text
