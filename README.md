@@ -110,4 +110,4 @@ streamlit run dashboard.py
 ---
 
 ## 🤝 Credits
-Developed by **Rakshith R** | Powered by **YOLOv8** & **Streamlit**
+Developed by **Rakshith R ** | Powered by **YOLOv8** & **Streamlit**
