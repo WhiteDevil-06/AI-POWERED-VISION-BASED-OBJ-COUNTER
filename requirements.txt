@@ -5,5 +5,3 @@ streamlit
 numpy
 scipy
 roboflow
-kagglehub
-ultralytics
