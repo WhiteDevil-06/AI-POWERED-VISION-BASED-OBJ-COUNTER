@@ -5,8 +5,10 @@ __pycache__/
 *.log
 *.tmp
 
+
 # Virtual Environments
 env/
+ieee_paper_context/
 
 # IDE / Editor
 .vscode/
